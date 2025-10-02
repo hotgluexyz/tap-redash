@@ -113,23 +113,82 @@ class Redash:
     # -------- Schema Inference -------- #
 
     @staticmethod
-    def _singer_type_for_value(value: Any) -> str:
-        """Infer Singer type from a Python value."""
+    def _singer_type_for_value(value: Any) -> Dict[str, Any]:
+        """Infer JSON Schema from a single Python value (no merging)."""
         if value is None:
-            return None
+            return {"type": "null"}
         if isinstance(value, bool):
-            return "boolean"
+            return {"type": "boolean"}
         if isinstance(value, int):
-            return "integer"
+            return {"type": "integer"}
         if isinstance(value, float):
-            return "number"
+            return {"type": "number"}
         if isinstance(value, str):
-            return "string"
+            return {"type": "string"}
         if isinstance(value, dict):
-            return "object"
+            return {
+                "type": "object",
+                "properties": {
+                    k: Redash._singer_type_for_value(v)
+                    for k, v in value.items()
+                },
+                "additionalProperties": False
+            }
         if isinstance(value, list):
-            return "array"
-        return "string"
+            if not value:
+                return {"type": "array"}
+            
+            if value[0] is None:
+                items_schema = {"type": "array", "items": {"type": "string"}} # if list is empty, default items type to strings
+            else:
+                items_schema = Redash._singer_type_for_value(value[0])
+            
+            return {
+                "type": "array",
+                "items": items_schema
+            }
+        return {"type": "string"}
+
+    @staticmethod
+    def _merge_schemas(schemas: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge multiple schemas into one with combined types, always nullable."""
+        merged: Dict[str, Any] = {}
+
+        # collect all types
+        types = []
+        for s in schemas:
+            t = s.get("type")
+            if isinstance(t, list):
+                types.extend(t)
+            else:
+                types.append(t)
+
+        # always allow null
+        types.append("null")
+
+        merged["type"] = sorted(set(types))
+
+        # merge object properties if needed
+        if "object" in types:
+            merged["properties"] = {}
+            for s in schemas:
+                if "properties" in s:
+                    for k, v in s["properties"].items():
+                        if k not in merged["properties"]:
+                            merged["properties"][k] = v
+                        else:
+                            merged["properties"][k] = Redash._merge_schemas(
+                                [merged["properties"][k], v]
+                            )
+            merged["additionalProperties"] = False
+
+        # merge array items if needed
+        if "array" in types:
+            item_schemas = [s.get("items") for s in schemas if "items" in s]
+            if item_schemas:
+                merged["items"] = Redash._merge_schemas(item_schemas)
+
+        return merged
 
     def _infer_properties(self, sample_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Infer schema properties from sample rows."""
@@ -141,18 +200,13 @@ class Redash:
             if not isinstance(row, dict):
                 continue
             for k, v in row.items():
-                t = self._singer_type_for_value(v)
-                if k not in union:
-                    union[k] = set()
-                if t is not None:
-                    union[k].add(t)
+                schema = Redash._singer_type_for_value(v)
+                union.setdefault(k, []).append(schema)
 
-        properties: Dict[str, Any] = {}
-        for field, type_set in union.items():
-            field_types = ["null"] + sorted(list(type_set)) if type_set else ["null", "string"]
-            properties[field] = {"type": field_types}
-
-        return properties
+        return {
+            k: Redash._merge_schemas(schemas)
+            for k, schemas in union.items()
+        }
 
     def generate_stream_entry(self, query: Dict[str, Any]) -> Dict[str, Any]:
         """Generate a stream entry for the Singer catalog from a query object."""
@@ -181,6 +235,25 @@ class Redash:
         key_props = self._config.get("key_properties", [])
         if not isinstance(key_props, list):
             key_props = []
+        
+        metadata = []
+        # Add breadcrumb entries for each property
+        for prop_name in properties.keys():
+            metadata.append({
+                "breadcrumb": ["properties", prop_name],
+                "metadata": {
+                    "inclusion": "available"
+                }
+            })
+        
+        metadata.append({
+            "breadcrumb": [],
+            "metadata": {
+                "query_id": query_id,
+                "query_name": query_name,
+                "selected": True  # Auto-select all streams by default
+            }
+        })
 
         stream_entry: Dict[str, Any] = {
             "stream": stream_name,
@@ -191,16 +264,7 @@ class Redash:
                 "additionalProperties": False,
             },
             "key_properties": key_props,
-            "metadata": [
-                {
-                    "breadcrumb": [],
-                    "metadata": {
-                        "query_id": query_id,
-                        "query_name": query_name,
-                        "selected": True  # Auto-select all streams by default
-                    }
-                }
-            ]
+            "metadata": metadata
         }
         return stream_entry
 

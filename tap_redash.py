@@ -4,6 +4,11 @@ import sys
 from typing import Any, Dict, List, Optional
 import requests as req
 import singer
+from time import sleep
+import io
+import csv
+import backoff
+from exceptions import RetriableException
 
 logger = singer.get_logger()
 logger.setLevel(logging.WARNING)
@@ -80,10 +85,106 @@ class Redash:
         else:
             # Fetch all queries
             return self._get_available_queries()
+    
+    def initialize_query(self, query_id: str, offset, limit) -> str:
+        """Initialize a query."""
+        url = f"{self._base_url}/api/queries/{query_id}/results"
+        params = {'api_key': self._api_key}
+        payload = {"max_age": 0, "parameters": {"offset": offset, "limit": limit}}
+        resp = self._session.post(url, params=params, json=payload, timeout=self._timeout)
+        try:
+            resp.raise_for_status()
+        except req.RequestException as e:
+            logger.warning("Error initializing query %s: %s. Response: %s", query_id, e, resp.text)
+            return None
+        return resp.json().get('job', {}).get('id')
+
+    def get_query_result_id(self, job_id: str) -> int:
+        """Check the status of a job and return the query result id if the job is complete."""
+        url = f"{self._base_url}/api/jobs/{job_id}"
+        params = {'api_key': self._api_key}
+        max_wait_time = 300  # 5 minutes in seconds
+        total_sleep_time = 0
+        sleep_time = 5
+
+        while total_sleep_time < max_wait_time:
+            resp = self._session.get(url, params=params, timeout=self._timeout)
+            try:
+                resp.raise_for_status()
+                # if status is 3 it means the job is complete and we can return the query result id
+                if resp.json().get('job', {}).get('status') in [3]:
+                    return resp.json().get('job', {}).get('query_result_id')
+                
+                # if status is 4 or 5 it means the job failed or was cancelled log and return None to skip the query
+                elif resp.json().get('job', {}).get('status') in [4, 5]:
+                    logger.warning("Job %s failed to complete with status: %s. Skipping.", job_id, resp.json().get('job', {}).get('status'))
+                    return None
+                
+                logger.warning("Job %s is still running. Sleeping for %s seconds and checking again.", job_id, sleep_time)
+                sleep(sleep_time)
+                total_sleep_time += sleep_time
+            except req.RequestException as e:
+                logger.warning("Error checking job status %s: %s. Response: %s", job_id, e, resp.text)
+                break
+    
+    def validate_response(self, resp: req.Response) -> None:
+        """Validate the response from the API."""
+        if 500 <= resp.status_code < 600:
+            raise RetriableException(f"Error: {resp.status_code} {resp.text}")
+        resp.raise_for_status()
+
+
+    @backoff.on_exception(
+        backoff.expo,
+        (RetriableException),
+        max_tries=5,
+        factor=2,
+        base=2
+    )
+    def get_query_results(self, query_result_id: str, discover: bool = False, stream_name: str = None) -> List[Dict[str, Any]]:
+        """Get the data for a query result."""
+        url = f"{self._base_url}/api/query_results/{query_result_id}.csv"
+        params = {'api_key': self._api_key}
+        resp = self._session.get(url, params=params, timeout=self._timeout)
+        try:
+            self.validate_response(resp)
+            if discover:
+                # For discovery, only return first 100 records for schema inference
+                with io.StringIO(resp.text) as csv_data:
+                    reader = csv.DictReader(csv_data)
+                    records = []
+                    for i, row in enumerate(reader):
+                        if i >= 100:
+                            break
+                        # Clean empty strings to None
+                        cleaned_row = {k: (None if v == '' else v) for k, v in row.items()}
+                        records.append(cleaned_row)
+                    return records
+            # For sync, read CSV in chunks and stream to output
+            with io.StringIO(resp.text) as csv_data:
+
+                # Get the full content
+                data = csv_data.getvalue()
+
+                # Remove NUL characters
+                cleaned = data.replace('\x00', '')
+
+                csv_data = io.StringIO(cleaned)
+                reader = csv.DictReader(csv_data)
+                for row in reader:
+                    # Clean empty strings to None
+                    cleaned_row = {k: (None if v == '' else v) for k, v in row.items()}
+                    singer.write_record(stream_name, cleaned_row)
+
+            return data.count('\n') >= 2
+               
+        except req.RequestException as e:
+            logger.warning("Error getting query result data %s: %s. Response: %s", query_result_id, e, resp.text)
+            raise
 
     # -------- Fetch Query Data -------- #
 
-    def _get_query_data(self, query_id: str) -> List[Dict[str, Any]]:
+    def _get_query_data(self, query_id: str, discover: bool = False, stream_name: str = None) -> List[Dict[str, Any]]:
         """Fetch the results for a specific query."""
         url = f"{self._base_url}/api/queries/{query_id}/results.json"
         params = {'api_key': self._api_key}
@@ -94,6 +195,25 @@ class Redash:
             payload = resp.json()
         except req.RequestException as e:
             logger.warning("Error fetching query %s results: %s", query_id, e)
+            if resp.json().get('message') == 'No cached result found for this query.':
+                offset = 0
+                limit = 10_000
+                while True:
+                    job_id = self.initialize_query(query_id, offset, limit)
+                    if job_id is None:
+                        logger.warning("Failed to initialize query %s. Skipping.", query_id)
+                        return None
+                    query_result_id = self.get_query_result_id(job_id)
+                    if query_result_id:
+                        rows = self.get_query_results(query_result_id, discover, stream_name)
+                        offset += limit
+                        if discover:
+                            return rows
+                        if not rows:
+                            break
+                    else:
+                        logger.warning("Job failed to complete for query '%s'. Skipping.", query_id,)
+                        return None
             return []
         except ValueError as e:
             logger.warning("Invalid JSON from query %s results: %s", query_id, e)
@@ -224,11 +344,12 @@ class Redash:
 
         # Fetch sample data to infer schema
         logger.info("Fetching sample data for query %s: %s", query_id, query_name)
-        data = self._get_query_data(query_id)
+        data = self._get_query_data(query_id, discover=True)
         
         if not data:
             properties: Dict[str, Any] = {}
             logger.warning("No data for query %s, using empty schema", query_id)
+            return None
         else:
             properties = self._infer_properties(data)
 
@@ -281,8 +402,12 @@ class Redash:
             logger.info("Found %d queries to include in catalog", len(queries))
             streams = []
             for query in queries:
+                if query.get('id') not in self._config.get('query_ids', []):
+                    continue
                 try:
                     stream_entry = self.generate_stream_entry(query)
+                    if stream_entry is None:
+                        continue
                     streams.append(stream_entry)
                 except Exception as e:
                     query_id = query.get('id', 'unknown')
@@ -323,7 +448,7 @@ class Redash:
             singer.write_schema(stream_name, schema, key_props)
 
             # Fetch and write records
-            data = self._get_query_data(tap_stream_id)
+            data = self._get_query_data(tap_stream_id, stream_name=stream_name)
             if data:
                 singer.write_records(stream_name, data)
                 logger.info("Wrote %d records for stream %s", len(data), stream_name)

@@ -286,6 +286,9 @@ class Redash:
         # always allow null
         types.append("null")
 
+        if len(set(types)) == 1:
+            types.append("string")
+
         merged["type"] = sorted(set(types))
 
         # merge object properties if needed

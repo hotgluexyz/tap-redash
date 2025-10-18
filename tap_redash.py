@@ -8,7 +8,6 @@ from time import sleep
 import io
 import csv
 import backoff
-from exceptions import RetriableException
 
 logger = singer.get_logger()
 logger.setLevel(logging.WARNING)
@@ -17,6 +16,10 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 
 REQUIRED_CONFIG_KEYS = ['BASE_URL', 'API_KEY']
 args = singer.utils.parse_args(REQUIRED_CONFIG_KEYS)
+
+class RetriableException(Exception):
+    """Exception for retriable errors."""
+    pass
 
 
 class Redash:

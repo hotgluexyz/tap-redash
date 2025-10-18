@@ -17,5 +17,5 @@ setup(
         [console_scripts]
         tap-redash=tap_redash:main
     ''',
-    python_requires='>=3.7',
+    python_requires='>=3.7'
 )
